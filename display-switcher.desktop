@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Display Switcher Tray
+Comment=Enable or disable monitors from the GNOME top bar
+Exec=display-switcher-tray
+Icon=video-display
+Terminal=false
+Categories=Utility;Settings;
+StartupNotify=false

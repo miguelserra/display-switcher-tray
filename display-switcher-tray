@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import time
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('AppIndicator3', '0.1')
+from gi.repository import Gtk, GLib, AppIndicator3, Gio
+
+CONFIG_DIR = os.path.expanduser('~/.config/display-switcher')
+CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
+
+class DisplaySwitcherApp:
+    def __init__(self):
+        self.pending_confirmation = None
+        self.confirmation_timer = None
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        self.load_config()
+
+        self.ind = AppIndicator3.Indicator.new(
+            'display-switcher-tray',
+            'video-display-symbolic',
+            AppIndicator3.IndicatorCategory.HARDWARE
+        )
+        self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        
+        self.menu = Gtk.Menu()
+        self.build_menu()
+        self.ind.set_menu(self.menu)
+
+        # Listen to DBus signals for monitor changes
+        self.setup_dbus_listener()
+
+    def load_config(self):
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    self.saved_config = json.load(f)
+            else:
+                self.saved_config = {}
+        except Exception:
+            self.saved_config = {}
+
+    def save_config(self, physical_monitors):
+        # Save positions and scales of enabled monitors
+        for conn, info in physical_monitors.items():
+            if info['enabled']:
+                self.saved_config[conn] = {
+                    'x': info['x'],
+                    'y': info['y'],
+                    'scale': info['scale'],
+                    'primary': info['primary']
+                }
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.saved_config, f, indent=2)
+        except Exception as e:
+            print(f"Error saving config: {e}", file=sys.stderr)
+
+    def get_display_state(self):
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            proxy = Gio.DBusProxy.new_sync(
+                bus, Gio.DBusProxyFlags.NONE, None,
+                'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', None
+            )
+            state = proxy.call_sync('GetCurrentState', None, Gio.DBusCallFlags.NONE, -1, None)
+            serial, monitors, logical_monitors, properties = state.unpack()
+            
+            physical = {}
+            for mon in monitors:
+                conn_info, modes, props = mon
+                connector, vendor, product, serial_num = conn_info
+                
+                pref_mode = None
+                curr_mode = None
+                for m in modes:
+                    m_id, w, h, refresh, pref_s, supp_s, m_props = m
+                    if m_props.get('is-current', False):
+                        curr_mode = (m_id, w, h, refresh, pref_s)
+                    if m_props.get('is-preferred', False):
+                        pref_mode = (m_id, w, h, refresh, pref_s)
+                
+                mode_to_use = curr_mode or pref_mode or (modes[0][0], modes[0][1], modes[0][2], modes[0][3], modes[0][4])
+                
+                name_parts = [p for p in [vendor, product] if p]
+                display_name = ' '.join(name_parts) if name_parts else connector
+                
+                saved = self.saved_config.get(connector, {})
+                physical[connector] = {
+                    'connector': connector,
+                    'vendor': vendor,
+                    'product': product,
+                    'display_name': f"{display_name} ({connector})",
+                    'mode': mode_to_use,
+                    'width': mode_to_use[1],
+                    'height': mode_to_use[2],
+                    'enabled': False,
+                    'x': saved.get('x', 0),
+                    'y': saved.get('y', 0),
+                    'scale': saved.get('scale', 1.0),
+                    'primary': saved.get('primary', False)
+                }
+            
+            for lm in logical_monitors:
+                x, y, scale, transform, primary, linked_monitors, lm_props = lm
+                for m in linked_monitors:
+                    connector = m[0]
+                    if connector in physical:
+                        physical[connector]['enabled'] = True
+                        physical[connector]['x'] = x
+                        physical[connector]['y'] = y
+                        physical[connector]['scale'] = scale
+                        physical[connector]['primary'] = primary
+
+            return serial, physical, monitors
+        except Exception as e:
+            print(f"Error getting display state: {e}", file=sys.stderr)
+            return 0, {}, []
+
+    def apply_monitors(self, target_connectors):
+        if self.pending_confirmation is not None:
+            self.pending_confirmation['dialog'].present()
+            return
+        # target_connectors: set of connectors that should be enabled
+        serial, physical, _ = self.get_display_state()
+        if not physical:
+            return
+
+        # Ensure at least one monitor is enabled
+        if not target_connectors:
+            return
+
+        self.save_config(physical)
+
+        # Build active configs list sorted by saved X or connector name
+        active_list = []
+        for conn in sorted(target_connectors):
+            if conn in physical:
+                info = physical[conn]
+                saved = self.saved_config.get(conn, {})
+                active_list.append({
+                    'conn': conn,
+                    'mode_id': info['mode'][0],
+                    'width': info['width'],
+                    'scale': saved.get('scale', 1.0),
+                    'saved_x': saved.get('x', 0),
+                    'primary': saved.get('primary', False)
+                })
+
+        # Pack horizontally
+        current_x = 0
+        packed_lms = []
+        has_primary = False
+
+        # Sort by saved X
+        active_list.sort(key=lambda m: (m['saved_x'], m['conn']))
+
+        # A previously disabled monitor may still have primary=True in the
+        # cache. Prefer the actual primary and submit exactly one primary.
+        primary_conn = next((conn for conn, info in physical.items()
+                             if conn in target_connectors and info['enabled']
+                             and info['primary']), None)
+        if primary_conn is None and active_list:
+            primary_conn = next((m['conn'] for m in active_list if m['primary']),
+                                active_list[0]['conn'])
+
+        for m in active_list:
+            log_w = int(m['width'] / m['scale'])
+            is_pri = m['conn'] == primary_conn
+            if is_pri:
+                has_primary = True
+            
+            packed_lms.append({
+                'x': current_x,
+                'y': 0,
+                'scale': m['scale'],
+                'transform': 0,
+                'primary': is_pri,
+                'connector': m['conn'],
+                'mode_id': m['mode_id']
+            })
+            current_x += log_w
+
+        if not has_primary and packed_lms:
+            packed_lms[0]['primary'] = True
+
+        # Construct GVariant for ApplyMonitorsConfig
+        # Signature: (uua(iiduba(ssa{sv}))a{sv})
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            proxy = Gio.DBusProxy.new_sync(
+                bus, Gio.DBusProxyFlags.NONE, None,
+                'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', None
+            )
+
+            # Save the exact logical layout, including mirrors and rotation.
+            before = proxy.call_sync('GetCurrentState', None, Gio.DBusCallFlags.NONE, 5000, None).unpack()
+            serial, previous_monitors, previous_layout, previous_properties = before
+            current_modes = {
+                spec[0]: next(mode[0] for mode in modes if mode[6].get('is-current'))
+                for spec, modes, _ in previous_monitors
+                if any(mode[6].get('is-current') for mode in modes)
+            }
+            restore_layout = [
+                (x, y, scale, transform, primary,
+                 [(spec[0], current_modes[spec[0]], {}) for spec in linked])
+                for x, y, scale, transform, primary, linked, _ in previous_layout
+            ]
+            restore_properties = {}
+            if 'layout-mode' in previous_properties:
+                restore_properties['layout-mode'] = GLib.Variant('u', previous_properties['layout-mode'])
+
+            lm_variants = []
+            for lm in packed_lms:
+                spec_variant = GLib.Variant('(ssa{sv})', (lm['connector'], lm['mode_id'], {}))
+                lm_variant = GLib.Variant('(iiduba(ssa{sv}))', (
+                    lm['x'], lm['y'], lm['scale'], lm['transform'], lm['primary'], [spec_variant]
+                ))
+                lm_variants.append(lm_variant)
+
+            param = GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', (serial, 1, lm_variants, {}))
+            proxy.call_sync('ApplyMonitorsConfig', param, Gio.DBusCallFlags.NONE, -1, None)
+            self.show_confirmation(proxy, restore_layout, restore_properties)
+            
+            # Refresh menu after short delay
+            GLib.timeout_add(500, self.refresh_menu)
+        except Exception as e:
+            print(f"Error applying monitors config: {e}", file=sys.stderr)
+            dialog = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text="Não foi possível alterar os ecrãs",
+            )
+            dialog.format_secondary_text(str(e))
+            dialog.connect('response', lambda widget, response: widget.destroy())
+            dialog.show_all()
+            GLib.idle_add(self.refresh_menu)
+
+    def show_confirmation(self, proxy, layout, properties):
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Manter esta configuração dos ecrãs?",
+            modal=True,
+        )
+        dialog.add_button("Reverter", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Manter", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        self.pending_confirmation = {
+            'dialog': dialog, 'proxy': proxy, 'layout': layout,
+            'properties': properties, 'deadline': time.monotonic() + 15,
+        }
+        self.menu.set_sensitive(False)
+        dialog.connect('response', self.finish_confirmation)
+        self.update_confirmation()
+        self.confirmation_timer = GLib.timeout_add(200, self.update_confirmation)
+        dialog.show_all()
+        dialog.present()
+
+    def update_confirmation(self):
+        pending = self.pending_confirmation
+        if pending is None:
+            return False
+        remaining = max(0, int(pending['deadline'] - time.monotonic() + 0.999))
+        if remaining == 0:
+            self.confirmation_timer = None
+            self.finish_confirmation(pending['dialog'], Gtk.ResponseType.CANCEL)
+            return False
+        pending['dialog'].format_secondary_text(
+            f"A configuração anterior será reposta dentro de {remaining} segundos."
+        )
+        return True
+
+    def finish_confirmation(self, dialog, response):
+        pending = self.pending_confirmation
+        if pending is None:
+            return
+        self.pending_confirmation = None
+        if self.confirmation_timer is not None:
+            GLib.source_remove(self.confirmation_timer)
+            self.confirmation_timer = None
+        dialog.destroy()
+        try:
+            if response != Gtk.ResponseType.OK:
+                proxy = pending['proxy']
+                # Mutter's serial changes when the new configuration is applied.
+                serial = proxy.call_sync('GetCurrentState', None, Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+                param = GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})',
+                                     (serial, 1, pending['layout'], pending['properties']))
+                proxy.call_sync('ApplyMonitorsConfig', param, Gio.DBusCallFlags.NONE, 5000, None)
+        except Exception as error:
+            warning = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE,
+                text="Não foi possível repor a configuração anterior",
+            )
+            warning.format_secondary_text(str(error))
+            warning.connect('response', lambda widget, response: widget.destroy())
+            warning.show_all()
+        finally:
+            self.refresh_menu()
+
+    def build_menu(self):
+        # Clear existing menu items
+        for child in self.menu.get_children():
+            self.menu.remove(child)
+
+        serial, physical, _ = self.get_display_state()
+
+        # Header title
+        header = Gtk.MenuItem(label="Gerir Ecrãs (Multi-PC)")
+        header.set_sensitive(False)
+        self.menu.append(header)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Presets
+        preset_all = Gtk.MenuItem(label="🖥️🖥️🖥️ Ligar Todos os Ecrãs")
+        preset_all.connect("activate", lambda w: self.apply_monitors(set(physical.keys())))
+        self.menu.append(preset_all)
+
+        if physical:
+            primary_conn = next((conn for conn, info in physical.items()
+                                 if info['enabled'] and info['primary']),
+                                next(iter(physical)))
+            preset_pri = Gtk.MenuItem(label="🖥️ Apenas Ecrã Principal")
+            preset_pri.connect("activate", lambda w: self.apply_monitors({primary_conn}))
+            self.menu.append(preset_pri)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Individual Toggles
+        for conn, info in physical.items():
+            is_enabled = info['enabled']
+            chk = Gtk.CheckMenuItem(label=info['display_name'])
+            chk.set_active(is_enabled)
+            
+            def on_toggled(widget, c=conn):
+                # Calculate new set of active connectors
+                _, current_physical, _ = self.get_display_state()
+                current_active = {c_name for c_name, inf in current_physical.items() if inf['enabled']}
+                if widget.get_active():
+                    current_active.add(c)
+                else:
+                    if len(current_active) <= 1:
+                        # Prevent turning off all monitors
+                        widget.set_active(True)
+                        return
+                    current_active.discard(c)
+                self.apply_monitors(current_active)
+
+            chk.connect("toggled", on_toggled)
+            self.menu.append(chk)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Settings link
+        settings_item = Gtk.MenuItem(label="Definições do Sistema...")
+        settings_item.connect("activate", self.open_gnome_settings)
+        self.menu.append(settings_item)
+
+        # Quit
+        quit_item = Gtk.MenuItem(label="Sair")
+        quit_item.connect("activate", lambda w: Gtk.main_quit())
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        self.menu.set_sensitive(self.pending_confirmation is None)
+
+    def refresh_menu(self):
+        self.build_menu()
+        return False
+
+    def setup_dbus_listener(self):
+        def on_signal(connection, sender_name, object_path, interface_name, signal_name, parameters, user_data):
+            if signal_name == 'MonitorsChanged':
+                GLib.idle_add(self.refresh_menu)
+
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            bus.signal_subscribe(
+                'org.gnome.Mutter.DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig',
+                'MonitorsChanged',
+                '/org/gnome/Mutter/DisplayConfig',
+                None,
+                Gio.DBusSignalFlags.NONE,
+                on_signal,
+                None
+            )
+        except Exception as e:
+            print(f"Could not subscribe to DBus signals: {e}", file=sys.stderr)
+
+    def open_gnome_settings(self, widget):
+        os.system("gnome-control-center display &")
+
+def main():
+    app = DisplaySwitcherApp()
+    Gtk.main()
+
+if __name__ == '__main__':
+    main()
