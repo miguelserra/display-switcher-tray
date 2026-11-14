@@ -9,7 +9,9 @@ AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 install -Dm755 "$SRC_DIR/display-switcher-tray" "$BIN_DIR/display-switcher-tray"
 install -Dm644 "$SRC_DIR/display-switcher.desktop" "$APP_DIR/display-switcher.desktop"
 install -Dm644 "$SRC_DIR/display-switcher.desktop" "$AUTOSTART_DIR/display-switcher.desktop"
-sed -i "s|^Exec=.*|Exec=$BIN_DIR/display-switcher-tray|" "$AUTOSTART_DIR/display-switcher.desktop"
+sed -i "s|^Exec=.*|Exec=$BIN_DIR/display-switcher-tray|" \
+    "$APP_DIR/display-switcher.desktop" \
+    "$AUTOSTART_DIR/display-switcher.desktop"
 
 echo "Installed:"
 echo "  $BIN_DIR/display-switcher-tray"
